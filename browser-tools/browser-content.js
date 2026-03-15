@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import puppeteer from "puppeteer-core";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
+import { connectBrowser, getActivePage } from "./browser-common.js";
 
 // Global timeout - exit if script takes too long
 const TIMEOUT = 30000;
@@ -24,23 +24,8 @@ if (!url) {
 	process.exit(1);
 }
 
-const b = await Promise.race([
-	puppeteer.connect({
-		browserURL: "http://localhost:9222",
-		defaultViewport: null,
-	}),
-	new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
-]).catch((e) => {
-	console.error("✗ Could not connect to browser:", e.message);
-	console.error("  Run: browser-start.js");
-	process.exit(1);
-});
-
-const p = (await b.pages()).at(-1);
-if (!p) {
-	console.error("✗ No active tab found");
-	process.exit(1);
-}
+const b = await connectBrowser();
+const p = await getActivePage(b);
 
 await Promise.race([
 	p.goto(url, { waitUntil: "networkidle2" }),

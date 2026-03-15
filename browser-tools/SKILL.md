@@ -5,25 +5,38 @@ description: Interactive browser automation via Chrome DevTools Protocol. Use wh
 
 # Browser Tools
 
-Chrome DevTools Protocol tools for agent-assisted web automation. These tools connect to Chrome running on `:9222` with remote debugging enabled.
+Chrome DevTools Protocol tools for agent-assisted web automation. Connects to Chrome running on the host with remote debugging enabled.
+
+## Prerequisites
+
+Chrome must be running on the host with remote debugging:
+
+```bash
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Linux
+google-chrome --remote-debugging-port=9222
+```
+
+The agent connects via `host.docker.internal:9222` (override with `BROWSER_URL` env var).
 
 ## Setup
 
 Run once before first use:
 
 ```bash
-cd {baseDir}/browser-tools
+cd {baseDir}
 npm install
 ```
 
-## Start Chrome
+## Check Connection
 
 ```bash
-{baseDir}/browser-start.js              # Fresh profile
-{baseDir}/browser-start.js --profile    # Copy user's profile (cookies, logins)
+{baseDir}/browser-start.js
 ```
 
-Launch Chrome with remote debugging on `:9222`. Use `--profile` to preserve user's authentication state.
+Verifies the agent can connect to Chrome and lists open tabs.
 
 ## Navigate
 
@@ -114,14 +127,9 @@ Wrap everything in an IIFE to run multi-statement code:
 
 ```javascript
 (function() {
-  // Multiple operations
   const data = document.querySelector('#target').textContent;
   const buttons = document.querySelectorAll('button');
-  
-  // Interactions
   buttons[0].click();
-  
-  // Return results
   return JSON.stringify({ data, buttonCount: buttons.length });
 })()
 ```
@@ -136,45 +144,6 @@ Wrap everything in an IIFE to run multi-statement code:
   actions.forEach(id => document.getElementById(id).click());
   return "Done";
 })()
-```
-
-### Typing/Input Sequences
-
-```javascript
-(function() {
-  const text = "HELLO";
-  for (const char of text) {
-    document.getElementById("key-" + char).click();
-  }
-  document.getElementById("submit").click();
-  return "Submitted: " + text;
-})()
-```
-
-### Reading App/Game State
-
-Extract structured state in one call:
-
-```javascript
-(function() {
-  const state = {
-    score: document.querySelector('.score')?.textContent,
-    status: document.querySelector('.status')?.className,
-    items: Array.from(document.querySelectorAll('.item')).map(el => ({
-      text: el.textContent,
-      active: el.classList.contains('active')
-    }))
-  };
-  return JSON.stringify(state, null, 2);
-})()
-```
-
-### Waiting for Updates
-
-If DOM updates after actions, add a small delay with bash:
-
-```bash
-sleep 0.5 && {baseDir}/browser-eval.js '...'
 ```
 
 ### Investigate Before Interacting
