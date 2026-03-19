@@ -192,6 +192,7 @@ const commands = {
         const input = {}
 
         if (args.title) input.title = args.title
+        if (args.description) input.description = args.description
         if (args.priority != null) input.priority = Number(args.priority)
 
         if (args.state) {
