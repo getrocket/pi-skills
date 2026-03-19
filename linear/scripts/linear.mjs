@@ -43,6 +43,19 @@ async function resolveTeamId(key) {
     return id
 }
 
+async function resolveProjectId(name) {
+    const data = await gql(
+        `query($filter: ProjectFilter) { projects(filter: $filter) { nodes { id name } } }`,
+        { filter: { name: { eq: name } } }
+    )
+    const id = data.projects.nodes[0]?.id
+    if (!id) {
+        console.error(`Error: Project '${name}' not found`)
+        process.exit(1)
+    }
+    return id
+}
+
 async function resolveIssueId(identifier) {
     const data = await gql(`query($id: String!) { issue(id: $id) { id team { id } } }`, { id: identifier })
     if (!data.issue) {
@@ -153,6 +166,14 @@ const commands = {
             const userId = await resolveUserId(args.assignee)
             if (userId) input.assigneeId = userId
         }
+        if (args.parent) {
+            const parent = await resolveIssueId(args.parent)
+            input.parentId = parent.id
+        }
+        if (args.project) {
+            const projectId = await resolveProjectId(args.project)
+            if (projectId) input.projectId = projectId
+        }
 
         const data = await gql(
             `mutation($input: IssueCreateInput!) {
@@ -182,6 +203,14 @@ const commands = {
         if (args.assignee) {
             const userId = await resolveUserId(args.assignee)
             if (userId) input.assigneeId = userId
+        }
+        if (args.parent) {
+            const parent = await resolveIssueId(args.parent)
+            input.parentId = parent.id
+        }
+        if (args.project) {
+            const projectId = await resolveProjectId(args.project)
+            if (projectId) input.projectId = projectId
         }
 
         const data = await gql(
@@ -288,8 +317,8 @@ Commands:
   issue <ID>                     Get issue details (e.g., ROC-141)
   search <query> [--limit N]     Search issues by text
   list [--team T] [--state S] [--assignee ME|NAME] [--limit N]
-  create --team T --title TITLE [--description D] [--priority 0-4] [--assignee EMAIL]
-  update <ID> [--state S] [--title T] [--priority 0-4] [--assignee EMAIL]
+  create --team T --title TITLE [--description D] [--priority 0-4] [--assignee EMAIL] [--parent ID] [--project NAME]
+  update <ID> [--state S] [--title T] [--priority 0-4] [--assignee EMAIL] [--parent ID] [--project NAME]
   comment <ID> --body TEXT       Add a comment to an issue
   states [--team T]              List workflow states
   labels [--team T]              List labels

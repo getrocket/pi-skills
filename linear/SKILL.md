@@ -63,6 +63,10 @@ This returns title, description, state, assignee, labels, comments, and more.
 ./scripts/linear.mjs create --team ROC --title "Fix login redirect" \
     --description "Users are redirected to a blank page after login" \
     --priority 2 --assignee user@example.com
+
+# With parent issue and project
+./scripts/linear.mjs create --team ROC --title "Sub-task" \
+    --parent ROC-398 --project "Search"
 ```
 
 Priority values: `0`=None, `1`=Urgent, `2`=High, `3`=Medium, `4`=Low
@@ -73,6 +77,8 @@ Priority values: `0`=None, `1`=Urgent, `2`=High, `3`=Medium, `4`=Low
 ./scripts/linear.mjs update ROC-141 --state "In Progress"
 ./scripts/linear.mjs update ROC-141 --priority 1 --assignee user@example.com
 ./scripts/linear.mjs update ROC-141 --title "Updated title"
+./scripts/linear.mjs update ROC-141 --parent ROC-398     # Set parent issue
+./scripts/linear.mjs update ROC-141 --project "Search"    # Set project
 ```
 
 ### Comment on an issue
