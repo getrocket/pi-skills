@@ -78,7 +78,7 @@ async function resolveStateId(teamId, name) {
         `query($filter: WorkflowStateFilter) {
             workflowStates(filter: $filter) { nodes { id } }
         }`,
-        { filter: { team: { id: { eq: teamId } }, name: { eqCaseInsensitive: name } } }
+        { filter: { team: { id: { eq: teamId } }, name: { eq: name } } }
     )
     return data.workflowStates.nodes[0]?.id ?? null
 }
@@ -136,7 +136,7 @@ const commands = {
     async list(args) {
         const filter = {}
         if (args.team) filter.team = { key: { eq: args.team } }
-        if (args.state) filter.state = { name: { eqCaseInsensitive: args.state } }
+        if (args.state) filter.state = { name: { eq: args.state } }
         if (args.assignee === 'ME' || args.assignee === 'me') {
             filter.assignee = { isMe: { eq: true } }
         } else if (args.assignee) {
