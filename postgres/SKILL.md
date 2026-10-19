@@ -40,6 +40,7 @@ Results are returned as a markdown table (default) or JSON. If results exceed 50
 
 ## Tips
 
+- Connections use `application_name=<env>-mcp-postgres` (`dev` by default). The production alert excludes `prod-mcp-postgres` and `dev-mcp-postgres` so skill query errors remain in logs without paging.
 - Use single quotes for string literals: `WHERE name = 'foo'`
 - Use double quotes for identifiers: `"Column-Name"`
 - Queries are read-only (enforced via `statement_timeout`)

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createClient } from '@clickhouse/client'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -143,12 +144,14 @@ const chFormat = args['ch-format'] || 'JSON'
 
 const client = createClient({
     url,
+    application: 'agent-skill',
     request_timeout: timeout
 })
 
 try {
     const resultSet = await client.query({
         query,
+        query_id: `agent-skill:${randomUUID()}`,
         format: chFormat,
         clickhouse_settings: {
             max_execution_time: Math.floor(timeout / 1000)

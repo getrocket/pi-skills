@@ -136,12 +136,13 @@ Examples:
     process.exit(0)
 }
 
-const connString = resolveEnvVar('POSTGRES_URL', args.env)
+const connString = new URL(resolveEnvVar('POSTGRES_URL', args.env))
+connString.searchParams.set('application_name', `${(args.env || 'dev').toLowerCase()}-mcp-postgres`)
 const timeout = clampTimeout(args.timeout)
 const format = args.format || 'table'
 
 const pool = new Pool({
-    connectionString: connString,
+    connectionString: connString.toString(),
     connectionTimeoutMillis: 10000,
     idleTimeoutMillis: 10000,
     max: 2

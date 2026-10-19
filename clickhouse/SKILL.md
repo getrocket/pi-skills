@@ -40,6 +40,7 @@ Results are returned as a markdown table (default) or JSON, including query stat
 
 ## Tips
 
+- Requests identify the application as `agent-skill` and use a unique `query_id` prefixed with `agent-skill:`. The production alert excludes that query-ID prefix so skill query errors remain in logs without paging.
 - Use single quotes for string literals
 - Use backticks for identifiers with special chars
 - The env var lookup order without `--env`: `CLICKHOUSE_URL` → `CLICKHOUSE_URL_DEV`

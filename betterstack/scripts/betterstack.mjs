@@ -7,6 +7,15 @@ const GLOBAL_TOKEN = process.env.BETTERSTACK_GLOBAL_TOKEN
 const TEAM_ID = 185745
 const CONN_CACHE = '/tmp/betterstack-connection.json'
 
+class ClickHouseError extends Error {
+    constructor(status, body) {
+        super(`ClickHouse error (${status})`)
+        this.name = 'ClickHouseError'
+        this.status = status
+        this.body = body
+    }
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────────────
 
 async function api(path, { method = 'GET', body, token = TOKEN } = {}) {
@@ -41,8 +50,7 @@ async function clickhouseQuery(sql, { host, username, password }) {
     })
     if (!res.ok) {
         const text = await res.text()
-        console.error(`ClickHouse error (${res.status}): ${text}`)
-        process.exit(1)
+        throw new ClickHouseError(res.status, text)
     }
     return res.text()
 }
@@ -54,6 +62,190 @@ function print(data) {
 function die(msg) {
     console.error(msg)
     process.exit(1)
+}
+
+function formatClickHouseError(error) {
+    if (!(error instanceof ClickHouseError)) return String(error)
+    return `ClickHouse error (${error.status}): ${error.body}`
+}
+
+function shouldFallbackToS3(error) {
+    if (!(error instanceof ClickHouseError)) return false
+    return /CLUSTER_DOESNT_EXIST|UNKNOWN_TABLE|UNKNOWN_DATABASE/.test(error.body)
+}
+
+function escapeSqlString(value) {
+    return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+function buildSearchFilter(search) {
+    if (!search) return ''
+    return ` AND raw LIKE '%${escapeSqlString(search)}%'`
+}
+
+function buildLogSubquery({ sourceRef, selectFields, sinceTs, whereExtra = '', searchFilter = '' }) {
+    return (
+        `SELECT ${selectFields} ` +
+        `FROM ${sourceRef} ` +
+        `WHERE dt >= toDateTime64(${sinceTs}, 0, 'UTC')${whereExtra}${searchFilter}`
+    )
+}
+
+function buildLogsSql({ tablePrefix, tableName, sinceTs, limit, search, rawOnly, mode }) {
+    const selectFields = rawOnly ? 'raw' : 'dt, raw'
+    const searchFilter = buildSearchFilter(search)
+
+    const hotLogsQuery = buildLogSubquery({
+        sourceRef: `remote(${tablePrefix}_${tableName}_logs)`,
+        selectFields,
+        sinceTs,
+        searchFilter
+    })
+
+    const s3LogsQuery = buildLogSubquery({
+        sourceRef: `s3Cluster(primary, ${tablePrefix}_${tableName}_s3)`,
+        selectFields,
+        sinceTs,
+        whereExtra: ' AND _row_type = 1',
+        searchFilter
+    })
+
+    let fromClause
+    if (mode === 'historical') {
+        fromClause = s3LogsQuery
+    } else if (mode === 'hot') {
+        fromClause = hotLogsQuery
+    } else {
+        fromClause = `${hotLogsQuery} UNION ALL ${s3LogsQuery}`
+    }
+
+    return (
+        `SELECT ${selectFields} ` +
+        `FROM (${fromClause}) ` +
+        `ORDER BY dt DESC ` +
+        `LIMIT ${limit} ` +
+        `SETTINGS output_format_json_array_of_rows = 1 ` +
+        `FORMAT JSONEachRow`
+    )
+}
+
+async function runLogsQueryWithFallback({ conn, source, sinceTs, limit, args }) {
+    const tableName = source.table_name
+    const teamId = source.team_id || TEAM_ID
+    const tablePrefix = `t${teamId}`
+
+    const attempts = args.historical
+        ? [
+              {
+                  label: 'historical S3 logs',
+                  sql: buildLogsSql({
+                      tablePrefix,
+                      tableName,
+                      sinceTs,
+                      limit,
+                      search: args.search,
+                      rawOnly: !!args.raw,
+                      mode: 'historical'
+                  })
+              }
+          ]
+        : [
+              {
+                  label: 'combined hot + S3 logs',
+                  sql: buildLogsSql({
+                      tablePrefix,
+                      tableName,
+                      sinceTs,
+                      limit,
+                      search: args.search,
+                      rawOnly: !!args.raw,
+                      mode: 'combined'
+                  })
+              },
+              {
+                  label: 'historical S3 logs fallback',
+                  sql: buildLogsSql({
+                      tablePrefix,
+                      tableName,
+                      sinceTs,
+                      limit,
+                      search: args.search,
+                      rawOnly: !!args.raw,
+                      mode: 'historical'
+                  })
+              }
+          ]
+
+    let lastError = null
+
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i]
+
+        if (args.verbose) {
+            console.error(`Log query attempt ${i + 1}/${attempts.length}: ${attempt.label}`)
+            console.error('SQL:', attempt.sql)
+        }
+
+        try {
+            const result = await clickhouseQuery(attempt.sql, conn)
+            if (i > 0) {
+                console.error(
+                    `Hot log cluster unavailable for ${tableName}; using ${attempt.label}.`
+                )
+            }
+            return result
+        } catch (error) {
+            lastError = error
+            if (!shouldFallbackToS3(error) || i === attempts.length - 1) {
+                throw error
+            }
+            console.error(
+                `Hot log query failed for ${tableName}; retrying against S3. ${formatClickHouseError(error)}`
+            )
+        }
+    }
+
+    throw lastError
+}
+
+function parseLogRows(result, { rawOnly }) {
+    try {
+        const rows = JSON.parse(result)
+        return rows.map((row) => {
+            try {
+                const raw = JSON.parse(row.raw)
+                return rawOnly ? raw : { dt: row.dt, ...raw }
+            } catch {
+                return row
+            }
+        })
+    } catch {
+        return null
+    }
+}
+
+async function getConnection(args, { dataRegion } = {}) {
+    if (args.host && args.user && args.pass) {
+        return { host: args.host, username: args.user, password: args.pass }
+    }
+
+    let conn = loadConnection()
+
+    const needsNewConnection =
+        !conn ||
+        (dataRegion && conn.data_region !== dataRegion)
+
+    if (needsNewConnection && GLOBAL_TOKEN) {
+        if (conn && dataRegion && conn.data_region !== dataRegion) {
+            console.error(`Cached connection is for region ${conn.data_region}, need ${dataRegion}. Reconnecting...`)
+        } else {
+            console.error('No cached connection. Creating one...')
+        }
+        await commands.connect({ team: args.team, region: dataRegion })
+        conn = loadConnection()
+    }
+
+    return conn
 }
 
 // ── Connection cache ────────────────────────────────────────────────────────
@@ -162,12 +354,16 @@ const commands = {
         }
 
         const teamName = args.team
+        const dataRegion = args.region
         const validHours = Number(args.hours ?? 1)
         const validUntil = new Date(Date.now() + validHours * 60 * 60 * 1000).toISOString()
 
         const body = {
             client_type: 'clickhouse',
             valid_until: validUntil
+        }
+        if (dataRegion) {
+            body.data_region = dataRegion
         }
         if (teamName) {
             body.team_names = [teamName]
@@ -193,6 +389,7 @@ const commands = {
             host: conn.host,
             username: conn.username,
             valid_until: conn.valid_until,
+            data_region: conn.data_region,
             cache_file: CONN_CACHE
         })
     },
@@ -201,29 +398,13 @@ const commands = {
         const sql = args._[0] || args.sql
         if (!sql) return die('Usage: betterstack.mjs query <SQL> [--host H --user U --pass P]')
 
-        let conn
-
-        // Check for explicit credentials
-        if (args.host && args.user && args.pass) {
-            conn = { host: args.host, username: args.user, password: args.pass }
-        } else {
-            // Try cached connection
-            conn = loadConnection()
-            if (!conn) {
-                // Try auto-connecting
-                if (GLOBAL_TOKEN) {
-                    console.error('No cached connection. Creating one...')
-                    await commands.connect({ team: args.team })
-                    conn = loadConnection()
-                }
-                if (!conn) {
-                    return die(
-                        'No connection available. Either:\n' +
-                            '  1. Run: betterstack.mjs connect  (requires BETTERSTACK_GLOBAL_TOKEN)\n' +
-                            '  2. Pass: --host H --user U --pass P'
-                    )
-                }
-            }
+        const conn = await getConnection(args)
+        if (!conn) {
+            return die(
+                'No connection available. Either:\n' +
+                    '  1. Run: betterstack.mjs connect  (requires BETTERSTACK_GLOBAL_TOKEN)\n' +
+                    '  2. Pass: --host H --user U --pass P'
+            )
         }
 
         const result = await clickhouseQuery(sql, conn)
@@ -239,86 +420,34 @@ const commands = {
                     '  --limit N        Max rows (default: 20)\n' +
                     '  --since DURATION How far back: 5m, 1h, 24h, 7d (default: 1h)\n' +
                     '  --search TEXT    Filter logs containing text\n' +
-                    '  --field EXPR     Custom field to select (can repeat)\n' +
-                    '  --historical     Query historical (S3) data instead of recent\n' +
-                    '  --raw            Show raw JSON column only'
+                    '  --historical     Query only S3 historical data\n' +
+                    '  --raw            Show raw JSON column only\n' +
+                    '  --verbose        Print SQL / fallback details to stderr'
             )
         }
 
-        // Resolve source to get table_name and team_id
         const source = await resolveSource(sourceName)
-        const tableName = source.table_name
-        const teamId = source.team_id || TEAM_ID
-        const tablePrefix = `t${teamId}`
-
         const limit = Number(args.limit ?? 20)
         const since = parseDuration(args.since || '1h')
         const sinceTs = Math.floor((Date.now() - since) / 1000)
 
-        let conn
-        if (args.host && args.user && args.pass) {
-            conn = { host: args.host, username: args.user, password: args.pass }
-        } else {
-            conn = loadConnection()
-            if (!conn) {
-                if (GLOBAL_TOKEN) {
-                    console.error('No cached connection. Creating one...')
-                    await commands.connect({ team: args.team })
-                    conn = loadConnection()
-                }
-                if (!conn) {
-                    return die(
-                        'No connection available. Run: betterstack.mjs connect'
-                    )
-                }
-            }
+        const conn = await getConnection(args, { dataRegion: source.data_region })
+        if (!conn) {
+            return die('No connection available. Run: betterstack.mjs connect')
         }
 
-        let fromClause
-        let whereExtra = ''
-        if (args.historical) {
-            fromClause = `s3Cluster(primary, ${tablePrefix}_${tableName}_s3)`
-            whereExtra = ' AND _row_type = 1'
-        } else {
-            fromClause = `remote(${tablePrefix}_${tableName}_logs)`
-        }
+        const result = await runLogsQueryWithFallback({
+            conn,
+            source,
+            sinceTs,
+            limit,
+            args
+        })
 
-        const selectFields = args.raw ? 'raw' : 'dt, raw'
-
-        let searchFilter = ''
-        if (args.search) {
-            searchFilter = ` AND raw LIKE '%${args.search.replace(/'/g, "\\'")}%'`
-        }
-
-        const sql =
-            `SELECT ${selectFields} ` +
-            `FROM ${fromClause} ` +
-            `WHERE dt >= toDateTime64(${sinceTs}, 0, 'UTC')${whereExtra}${searchFilter} ` +
-            `ORDER BY dt DESC ` +
-            `LIMIT ${limit} ` +
-            `SETTINGS output_format_json_array_of_rows = 1 ` +
-            `FORMAT JSONEachRow`
-
-        if (args.verbose) {
-            console.error('SQL:', sql)
-        }
-
-        const result = await clickhouseQuery(sql, conn)
-
-        // Try to parse and pretty-print
-        try {
-            const rows = JSON.parse(result)
-            const parsed = rows.map((row) => {
-                try {
-                    const raw = JSON.parse(row.raw)
-                    return args.raw ? raw : { dt: row.dt, ...raw }
-                } catch {
-                    return row
-                }
-            })
+        const parsed = parseLogRows(result, { rawOnly: !!args.raw })
+        if (parsed) {
             print(parsed)
-        } catch {
-            // Output as-is if not JSON
+        } else {
             console.log(result)
         }
     },
@@ -330,25 +459,47 @@ const commands = {
         const source = await resolveSource(sourceName)
         const tableName = source.table_name
         const teamId = source.team_id || TEAM_ID
-        const tableRef = `remote(t${teamId}_${tableName}_logs)`
+        const tablePrefix = `t${teamId}`
 
-        let conn
-        if (args.host && args.user && args.pass) {
-            conn = { host: args.host, username: args.user, password: args.pass }
-        } else {
-            conn = loadConnection()
-            if (!conn) {
-                if (GLOBAL_TOKEN) {
-                    console.error('No cached connection. Creating one...')
-                    await commands.connect({ team: args.team })
-                    conn = loadConnection()
+        const conn = await getConnection(args, { dataRegion: source.data_region })
+        if (!conn) return die('No connection available. Run: betterstack.mjs connect')
+
+        const attempts = [
+            {
+                label: 'hot log schema',
+                sql: `DESCRIBE TABLE remote(${tablePrefix}_${tableName}_logs) FORMAT JSON`
+            },
+            {
+                label: 'historical S3 schema fallback',
+                sql: `DESCRIBE TABLE s3Cluster(primary, ${tablePrefix}_${tableName}_s3) FORMAT JSON`
+            }
+        ]
+
+        let result
+        for (let i = 0; i < attempts.length; i++) {
+            const attempt = attempts[i]
+            if (args.verbose) {
+                console.error(`Schema query attempt ${i + 1}/${attempts.length}: ${attempt.label}`)
+                console.error('SQL:', attempt.sql)
+            }
+            try {
+                result = await clickhouseQuery(attempt.sql, conn)
+                if (i > 0) {
+                    console.error(
+                        `Hot log schema unavailable for ${tableName}; using ${attempt.label}.`
+                    )
                 }
-                if (!conn) return die('No connection available. Run: betterstack.mjs connect')
+                break
+            } catch (error) {
+                if (!shouldFallbackToS3(error) || i === attempts.length - 1) {
+                    throw error
+                }
+                console.error(
+                    `Hot log schema query failed for ${tableName}; retrying against S3. ${formatClickHouseError(error)}`
+                )
             }
         }
 
-        const sql = `DESCRIBE TABLE ${tableRef} FORMAT JSON`
-        const result = await clickhouseQuery(sql, conn)
         try {
             const parsed = JSON.parse(result)
             print(parsed.data || parsed)
@@ -366,7 +517,7 @@ const commands = {
                 const data = await api('/sources?per_page=1')
                 info.api_status = 'ok'
                 info.total_sources = data.data?.length >= 0 ? 'accessible' : 'unknown'
-            } catch (e) {
+            } catch {
                 info.api_status = 'error'
             }
         }
@@ -432,13 +583,13 @@ if (!command || command === 'help' || command === '--help') {
 Commands:
   status                         Check API connection and cached credentials
   sources [--filter TEXT]        List all log sources
-  source <id_or_name>           Get source details
+  source <id_or_name>            Get source details
   connect [--team NAME] [--hours N]
                                  Create a ClickHouse connection (requires BETTERSTACK_GLOBAL_TOKEN)
   query <SQL>                    Run a raw ClickHouse SQL query
   logs <source> [--limit N] [--since DURATION] [--search TEXT] [--historical] [--raw] [--verbose]
-                                 Fetch recent logs from a source
-  schema <source>                Show table schema for a source
+                                 Fetch logs (tries hot + S3, falls back to S3 when needed)
+  schema <source> [--verbose]    Show table schema for a source
 
 Data source tables (for raw queries):
   Recent logs:      remote(t<team_id>_<table_name>_logs)
@@ -462,4 +613,11 @@ Key source IDs (Titan):
 
 if (!commands[command]) die(`Unknown command: ${command}\nRun with --help for usage.`)
 
-commands[command](parseArgs(rest))
+commands[command](parseArgs(rest)).catch((error) => {
+    if (error instanceof ClickHouseError) {
+        console.error(formatClickHouseError(error))
+        process.exit(1)
+    }
+    console.error(error?.stack || String(error))
+    process.exit(1)
+})
