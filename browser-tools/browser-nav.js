@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
-import { connectBrowser } from "./browser-common.js";
+import { connectBrowser, getActivePage } from "./browser-common.js";
 
 const args = process.argv.slice(2);
 const newTab = args.includes("--new");
 const reload = args.includes("--reload");
-const url = args.find(a => !a.startsWith("--"));
+const url = args.find((a) => !a.startsWith("--"));
 
 if (!url) {
 	console.log("Usage: browser-nav.js <url> [--new] [--reload]");
@@ -23,7 +23,7 @@ if (newTab) {
 	await p.goto(url, { waitUntil: "domcontentloaded" });
 	console.log("✓ Opened:", url);
 } else {
-	const p = (await b.pages()).at(-1);
+	const p = await getActivePage(b);
 	await p.goto(url, { waitUntil: "domcontentloaded" });
 	if (reload) {
 		await p.reload({ waitUntil: "domcontentloaded" });

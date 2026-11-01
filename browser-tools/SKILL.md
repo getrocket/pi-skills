@@ -5,161 +5,110 @@ description: Interactive browser automation via Chrome DevTools Protocol. Use wh
 
 # Browser Tools
 
-Chrome DevTools Protocol tools for agent-assisted web automation. Connects to Chrome running on the host with remote debugging enabled.
+Connect to Chrome on the host through its remote debugging interface. Use the existing host browser when running in a container; keep browser profiles outside the repository. Do not launch or install a container browser to work around a host connection failure.
 
-## Prerequisites
+## Connection and setup
 
-Chrome must be running on the host with remote debugging:
+Chrome must already have remote debugging enabled. The default endpoint is `http://host.docker.internal:9222`. `BROWSER_URL` overrides it, for example `http://localhost:9222` when running on the host. The helper resolves `host.docker.internal` to an IPv4 address, including when explicitly configured, because Chrome rejects that hostname in the debugging endpoint's Host header.
 
-```bash
-# macOS
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
-
-# Linux
-google-chrome --remote-debugging-port=9222
-```
-
-The agent connects via `host.docker.internal:9222` (override with `BROWSER_URL` env var).
-
-## Setup
-
-Run once before first use:
+Use Node.js 22 or newer. Dependencies are normally already installed. Only if they are missing:
 
 ```bash
 cd {baseDir}
-npm install
+PUPPETEER_SKIP_DOWNLOAD=1 npm ci
 ```
 
-## Check Connection
+Check the connection and list tab IDs:
 
 ```bash
 {baseDir}/browser-start.js
 ```
 
-Verifies the agent can connect to Chrome and lists open tabs.
+The helper uses the existing Puppeteer 24 dependency. Puppeteer 23 can stall during attachment when isolated contexts with existing iframes are open, even though Chrome's HTTP and WebSocket endpoints respond.
 
-## Navigate
+## Select the intended tab
 
-```bash
-{baseDir}/browser-nav.js https://example.com
-{baseDir}/browser-nav.js https://example.com --new
-```
-
-Navigate to URLs. Use `--new` flag to open in a new tab instead of reusing current tab.
-
-## Evaluate JavaScript
+With multiple tabs, use the ID from `browser-start.js`:
 
 ```bash
-{baseDir}/browser-eval.js 'document.title'
-{baseDir}/browser-eval.js 'document.querySelectorAll("a").length'
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-eval.js 'document.title'
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-nav.js http://localhost:3000/orbit
 ```
 
-Execute JavaScript in the active tab. Code runs in async context. Use this to extract data, inspect page state, or perform DOM operations programmatically.
+Tab order does not indicate focus or the newest tab. Commands that operate on an existing page require `BROWSER_TARGET_ID` when more than one tab exists. In a script, keep the `Page` returned by `newPage()` or call `getActivePage(browser, targetId)` explicitly. A missing ID fails rather than choosing another user's tab.
 
-## Screenshot
+## Keep one connection for a workflow
 
-```bash
-{baseDir}/browser-screenshot.js
-```
-
-Capture current viewport and return temporary file path. Use this to visually inspect page state or verify UI changes.
-
-## Pick Elements
-
-```bash
-{baseDir}/browser-pick.js "Click the submit button"
-```
-
-**IMPORTANT**: Use this tool when the user wants to select specific DOM elements on the page. This launches an interactive picker that lets the user click elements to select them. The user can select multiple elements (Cmd/Ctrl+Click) and press Enter when done. The tool returns CSS selectors for the selected elements.
-
-Common use cases:
-- User says "I want to click that button" → Use this tool to let them select it
-- User says "extract data from these items" → Use this tool to let them select the elements
-- When you need specific selectors but the page structure is complex or ambiguous
-
-## Cookies
-
-```bash
-{baseDir}/browser-cookies.js
-```
-
-Display all cookies for the current tab including domain, path, httpOnly, and secure flags. Use this to debug authentication issues or inspect session state.
-
-## Extract Page Content
-
-```bash
-{baseDir}/browser-content.js https://example.com
-```
-
-Navigate to a URL and extract readable content as markdown. Uses Mozilla Readability for article extraction and Turndown for HTML-to-markdown conversion. Works on pages with JavaScript content (waits for page to load).
-
-## When to Use
-
-- Testing frontend code in a real browser
-- Interacting with pages that require JavaScript
-- When user needs to visually see or interact with a page
-- Debugging authentication or session issues
-- Scraping dynamic content that requires JS execution
-
----
-
-## Efficiency Guide
-
-### DOM Inspection Over Screenshots
-
-**Don't** take screenshots to see page state. **Do** parse the DOM directly:
+For multiple steps or users, use one Node script and keep its connection open through authentication, context creation, navigation, requests, and assertions. `connectBrowser()` shares pending and established connections **within that Node process**; separate CLI invocations cannot share it. Disconnect once when finished. A later call after disconnect or a failed connection can reconnect.
 
 ```javascript
-// Get page structure
-document.body.innerHTML.slice(0, 5000)
+import { connectBrowser, getActivePage } from "{baseDir}/browser-common.js";
 
-// Find interactive elements
-Array.from(document.querySelectorAll('button, input, [role="button"]')).map(e => ({
-  id: e.id,
-  text: e.textContent.trim(),
-  class: e.className
-}))
+const browser = await connectBrowser();
+try {
+    const page = await getActivePage(browser); // BROWSER_TARGET_ID selects the tab.
+    await page.goto("http://localhost:3000/orbit", { waitUntil: "domcontentloaded" });
+    await page.waitForSelector('textarea[placeholder="Type a message…"]');
+    console.log(await page.title());
+    // Continue this workflow using the same browser and page objects.
+} finally {
+    await browser.disconnect(); // Leave host Chrome running.
+}
 ```
 
-### Complex Scripts in Single Calls
+For concurrent users, create separate `browser.createBrowserContext()` contexts on this connection and retain their page objects. Use the application's approved development login flow; keep any session credentials in memory. Verify the authenticated identity in each context before sending requests. Close only the contexts and tabs created by the test in `finally`, before disconnecting. Use `browser.disconnect()`, not `browser.close()`, to leave the user's browser running.
 
-Wrap everything in an IIFE to run multi-statement code:
+## Diagnose failures by stage
 
-```javascript
-(function() {
-  const data = document.querySelector('#target').textContent;
-  const buttons = document.querySelectorAll('button');
-  buttons[0].click();
-  return JSON.stringify({ data, buttonCount: buttons.length });
-})()
-```
+The helper reports distinct failures for HTTP discovery, the debugging WebSocket, and Puppeteer attachment. Each connection stage has a bounded wait; failed attachment closes the connection it opened and clears its timers. It throws an error so the caller can clean up its own test resources.
 
-### Batch Interactions
+- **HTTP discovery failed:** check the host address, port, and remote debugging endpoint. A container process list does not establish whether a host process is running.
+- **HTTP succeeded, WebSocket failed:** the discovery endpoint is reachable; inspect the reported debugging socket and host connection.
+- **HTTP and WebSocket succeeded, attachment failed:** Chrome is reachable. Keep the workflow on one connection and inspect attachment behavior; do not treat this as proof Chrome is stopped.
 
-**Don't** make separate calls for each click. **Do** batch them:
+A single reconnect is reasonable after a transient failure. If it persists, stop browser actions and report the failing stage and remaining tests. Do not restart or kill host processes, alter host configuration, or close unrelated contexts as a recovery shortcut.
 
-```javascript
-(function() {
-  const actions = ["btn1", "btn2", "btn3"];
-  actions.forEach(id => document.getElementById(id).click());
-  return "Done";
-})()
-```
+## Interact with the page
 
-### Investigate Before Interacting
-
-Always start by understanding the page structure:
+Inspect DOM state and available controls before interacting. Prefer DOM reads for state checks; use screenshots when visual appearance is the thing being checked.
 
 ```javascript
-(function() {
-  return {
+await page.evaluate(() => ({
     title: document.title,
-    forms: document.forms.length,
-    buttons: document.querySelectorAll('button').length,
-    inputs: document.querySelectorAll('input').length,
-    mainContent: document.body.innerHTML.slice(0, 3000)
-  };
-})()
+    buttons: Array.from(document.querySelectorAll("button")).map((button) => ({
+        label: button.getAttribute("aria-label") || button.textContent.trim(),
+        disabled: button.disabled
+    }))
+}));
 ```
 
-Then target specific elements based on what you find.
+Host Chrome may be backgrounded. Animation-frame waits and pointer-driven clicks can stall there. For state checks use `waitForFunction` with explicit polling, such as `{ polling: 100, timeout: 15000 }`. For a simple button, `page.$eval(selector, button => button.click())` can exercise the actual handler without relying on foreground rendering. Use real pointer or keyboard interaction when that behavior is part of the test. Wait for the resulting application state before the next dependent action.
+
+Batch independent reads or actions; keep dependent navigation and state transitions in order. Wait for streaming responses and final stdout to finish before declaring a test complete.
+
+## CLI commands
+
+Use these for individual operations; use the persistent script workflow above for a sequence. Set `BROWSER_TARGET_ID` for commands that use an existing tab.
+
+```bash
+# Navigation; --new opens a tab and does not require an existing tab ID.
+{baseDir}/browser-nav.js https://example.com --new
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-nav.js https://example.com --reload
+
+# Evaluate JavaScript in the selected page.
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-eval.js 'document.title'
+
+# Screenshot; prints the temporary image path.
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-screenshot.js
+
+# Let the user select page elements interactively.
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-pick.js "Select the submit button"
+
+# Inspect cookies when needed for an authentication investigation.
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-cookies.js
+
+# Navigate the selected tab and extract readable Markdown.
+BROWSER_TARGET_ID=<tab-id> {baseDir}/browser-content.js https://example.com
+```
+
+Use `browser-pick.js` when the user asks to select specific elements visually. Cookie output includes credentials; inspect it only when needed and keep those values out of reports and saved artifacts. Content extraction uses Readability and Turndown, without adding dependencies to the application under test.
