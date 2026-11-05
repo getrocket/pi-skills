@@ -56,6 +56,18 @@ All commands use `scripts/betterstack.mjs` (relative to this skill directory). N
 ./scripts/betterstack.mjs source titan_node_js        # By table_name
 ```
 
+### List and inspect dashboards
+
+Dashboards live only on the v2 API (`/api/v2/dashboards`); `/api/v1/dashboards` returns 404. Uses the team token, no ClickHouse connection needed.
+
+```bash
+./scripts/betterstack.mjs dashboards                  # All dashboards: id, name, updated_at
+./scripts/betterstack.mjs dashboards --filter postgres
+./scripts/betterstack.mjs dashboard 560335            # Name, variables, charts (id, name, type)
+```
+
+A dashboard URL like `https://telemetry.betterstack.com/team/t140953/dashboards/560335` carries the ID at the end. The API returns chart names and types but not the chart SQL; to see what a chart shows, query the backing source directly (e.g. `remote(t185745_titan_postgres_metrics_2_metrics)`) or open the URL in the browser.
+
 ### Create a ClickHouse connection
 
 Creates temporary credentials (cached for ~1 hour). Required before running SQL queries.

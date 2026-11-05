@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 const TELEMETRY_API = 'https://telemetry.betterstack.com/api/v1'
+// Dashboards exist only under v2; /api/v1/dashboards returns 404
+const TELEMETRY_API_V2 = 'https://telemetry.betterstack.com/api/v2'
 const TOKEN = process.env.BETTERSTACK_API_TOKEN
 const GLOBAL_TOKEN = process.env.BETTERSTACK_GLOBAL_TOKEN
 
@@ -18,7 +20,7 @@ class ClickHouseError extends Error {
 
 // ── HTTP helpers ────────────────────────────────────────────────────────────
 
-async function api(path, { method = 'GET', body, token = TOKEN } = {}) {
+async function api(path, { method = 'GET', body, token = TOKEN, base = TELEMETRY_API } = {}) {
     if (!token) {
         console.error('Error: BETTERSTACK_API_TOKEN environment variable is not set.')
         console.error('Get one from: Better Stack → API tokens → Team-based tokens')
@@ -29,7 +31,7 @@ async function api(path, { method = 'GET', body, token = TOKEN } = {}) {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
     }
     if (body) opts.body = JSON.stringify(body)
-    const res = await fetch(`${TELEMETRY_API}${path}`, opts)
+    const res = await fetch(`${base}${path}`, opts)
     if (!res.ok) {
         const text = await res.text()
         console.error(`API error (${res.status}): ${text}`)
@@ -343,6 +345,40 @@ const commands = {
         print(data)
     },
 
+    async dashboards(args) {
+        const dashboards = []
+        let page = 1
+        const filter = args.filter?.toLowerCase()
+        while (true) {
+            const data = await api(`/dashboards?per_page=100&page=${page}`, { base: TELEMETRY_API_V2 })
+            for (const d of data.data) {
+                const a = d.attributes
+                if (filter && !a.name.toLowerCase().includes(filter)) continue
+                dashboards.push({ id: d.id, name: a.name, updated_at: a.updated_at })
+            }
+            if (!data.pagination?.next) break
+            page++
+        }
+        print(dashboards)
+    },
+
+    async dashboard(args) {
+        const id = args._[0]
+        if (!id || !/^\d+$/.test(id)) {
+            return die('Usage: betterstack.mjs dashboard <dashboard_id>  (ID from `dashboards` or the dashboard URL)')
+        }
+        const data = await api(`/dashboards/${id}`, { base: TELEMETRY_API_V2 })
+        const a = data.data.attributes
+        print({
+            id: data.data.id,
+            name: a.name,
+            updated_at: a.updated_at,
+            date_range: { from: a.date_range_from, to: a.date_range_to },
+            variables: a.variables.map((v) => ({ name: v.name, type: v.variable_type, values: v.values })),
+            charts: a.charts.map((c) => ({ id: c.id, name: c.name, type: c.chart_type }))
+        })
+    },
+
     async connect(args) {
         if (!GLOBAL_TOKEN) {
             return die(
@@ -584,6 +620,8 @@ Commands:
   status                         Check API connection and cached credentials
   sources [--filter TEXT]        List all log sources
   source <id_or_name>            Get source details
+  dashboards [--filter TEXT]     List dashboards (v2 API)
+  dashboard <id>                 Dashboard metadata, variables and charts (ID from URL .../dashboards/<id>)
   connect [--team NAME] [--hours N]
                                  Create a ClickHouse connection (requires BETTERSTACK_GLOBAL_TOKEN)
   query <SQL>                    Run a raw ClickHouse SQL query
